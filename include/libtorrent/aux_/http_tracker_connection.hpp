@@ -53,6 +53,12 @@ namespace libtorrent::aux {
 		// by tracker_manager (a friend).
 		void queue_request(tracker_request req, std::weak_ptr<request_callback> c);
 
+		// drop queued followers when aborting. With keep_stopped, stop-requests
+		// are kept (close() then re-dispatches them, since they must still be
+		// announced while shutting down) and the rest dropped; otherwise all are
+		// dropped. Used by tracker_manager::abort_all_requests.
+		void prune_followers(bool keep_stopped);
+
 	private:
 
 		std::shared_ptr<http_tracker_connection> shared_from_this()
@@ -76,6 +82,11 @@ namespace libtorrent::aux {
 		void on_response(error_code const& ec, aux::http_parser const& parser
 			, span<char const> data);
 
+		// write-completion handler for write_only (stop-announce) connections.
+		// Advances to the next queued request or closes, just like on_response
+		// does after a normal response.
+		void on_write_complete(aux::http_connection& c);
+
 		void on_timeout(error_code const&) override {}
 
 		std::shared_ptr<aux::http_connection> m_tracker_connection;
@@ -86,6 +97,19 @@ namespace libtorrent::aux {
 		// request (which is the base class m_req / m_requester). They are issued
 		// one at a time as each response completes, reusing the keep-alive socket.
 		std::deque<std::pair<tracker_request, std::weak_ptr<request_callback>>> m_followers;
+
+		// true when this connection was started in write_only mode (stop announce
+		// during shutdown): set once at send_request() time and consulted in
+		// next_request() to decide whether to enter the flushing-wait state.
+		// Using m_man.is_stopping() directly in next_request() would be wrong:
+		// the session may start shutting down AFTER a non-write_only connection
+		// is created, which would leave the connection stuck without a close path.
+		bool m_write_only = false;
+
+		// for a write_only (stop) connection: set once all queued stops have been
+		// written, while we wait for the deadline timer before closing (so the
+		// drain loop can read outstanding responses and close stays graceful).
+		bool m_flushing = false;
 	};
 
 	TORRENT_EXTRA_EXPORT tracker_response parse_tracker_response(

@@ -96,11 +96,13 @@ void http_connection::get(std::string const& url,
 #if TORRENT_USE_I2P
 	i2p_connection* i2p_conn,
 #endif
-	bool const keep_alive)
+	bool const keep_alive,
+	bool const write_only)
 {
 	m_user_agent = user_agent;
 	m_resolve_flags = resolve_flags;
 	m_keep_alive = keep_alive;
+	m_write_only = write_only;
 
 	error_code ec;
 
@@ -256,8 +258,11 @@ void http_connection::start(std::string const& hostname, int port
 	// endpoint. m_reusable is consumed here: it is set again only when the next
 	// response finishes cleanly, so a failed reused request won't be retried on
 	// a stale socket.
-	bool const reuse_connection = m_sock && m_sock->is_open() && m_reusable && proxy_matches
-		&& m_hostname == hostname && m_port == port && m_ssl == ssl && m_bind_addr == bind_addr;
+	// in write_only mode there is no response to read, so the socket stays usable
+	// for the next write without a prior m_reusable signal.
+	bool const reuse_connection = m_sock && m_sock->is_open() && (m_reusable || m_write_only)
+		&& proxy_matches && m_hostname == hostname && m_port == port && m_ssl == ssl
+		&& m_bind_addr == bind_addr;
 	m_reusable = false;
 
 	if (reuse_connection)
@@ -431,6 +436,14 @@ void http_connection::on_timeout(std::weak_ptr<http_connection> p
 			if (!c->m_connecting) c->connect();
 			c->m_last_receive = now;
 			c->m_start_time = c->m_last_receive;
+		}
+		else if (c->m_write_only)
+		{
+			// write_only: the deadline means the pipelined writes are done and
+			// the drain has read the responses. Let the handler close the
+			// connection gracefully (FIN), rather than an abrupt timed-out close.
+			if (c->m_write_handler) c->m_write_handler(*c);
+			return;
 		}
 		else
 		{
@@ -698,6 +711,22 @@ void http_connection::on_write(error_code const& e)
 	if (m_abort) return;
 
 	std::string().swap(m_sendbuffer);
+
+	// fire-and-forget: the request is on the wire; don't parse a response. Keep a
+	// drain loop running so responses don't back up (which would stall the server
+	// and turn our eventual close() into a RST). The handler then writes the next
+	// request or closes the connection.
+	if (m_write_only)
+	{
+		if (!m_draining)
+		{
+			m_draining = true;
+			start_drain();
+		}
+		if (m_write_handler) m_write_handler(*this);
+		return;
+	}
+
 	m_recvbuffer.resize(4096);
 
 	int amount_to_read = int(m_recvbuffer.size()) - m_read_pos;
@@ -719,6 +748,23 @@ void http_connection::on_write(error_code const& e)
 		, std::size_t(amount_to_read))
 		, std::bind(&http_connection::on_read
 			, shared_from_this(), _1, _2));
+}
+
+void http_connection::start_drain()
+{
+	// read whatever the server sends and discard it. We never parse responses in
+	// write_only mode; this just keeps the receive buffer empty.
+	m_drain_buffer.resize(4096);
+	ADD_OUTSTANDING_ASYNC("http_connection::on_drain");
+	m_sock->async_read_some(boost::asio::buffer(m_drain_buffer.data(), m_drain_buffer.size()),
+		std::bind(&http_connection::on_drain, shared_from_this(), _1, _2));
+}
+
+void http_connection::on_drain(error_code const& e, std::size_t)
+{
+	COMPLETE_ASYNC("http_connection::on_drain");
+	if (e || m_abort) return;
+	start_drain();
 }
 
 void http_connection::on_read(error_code const& e
@@ -815,12 +861,10 @@ void http_connection::on_read(error_code const& e
 				m_user_agent,
 				m_bind_addr,
 				m_resolve_flags,
-				auth
+				auth,
 #if TORRENT_USE_I2P
-				,
-				m_i2p_conn
+				m_i2p_conn,
 #endif
-				,
 				m_keep_alive);
 			return;
 		}

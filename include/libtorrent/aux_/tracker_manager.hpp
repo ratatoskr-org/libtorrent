@@ -26,6 +26,13 @@ see LICENSE file.
 #include <memory>
 #include <unordered_map>
 #include <deque>
+#include <cstddef>
+
+#include <boost/multi_index_container.hpp>
+#include <boost/multi_index/sequenced_index.hpp>
+#include <boost/multi_index/hashed_index.hpp>
+#include <boost/multi_index/member.hpp>
+#include <boost/multi_index/mem_fun.hpp>
 
 #include "libtorrent/flags.hpp"
 #include "libtorrent/socket.hpp"
@@ -368,6 +375,7 @@ using tracker_request_flags_t = flags::bitfield_flag<std::uint8_t, struct tracke
 
 		aux::session_settings const& settings() const { return m_settings; }
 		aux::resolver_interface& host_resolver() { return m_host_resolver; }
+		bool is_stopping() const { return m_abort; }
 
 		void send_hostname(aux::listen_socket_handle const& sock
 			, char const* hostname, int port, span<char const> p
@@ -384,8 +392,88 @@ using tracker_request_flags_t = flags::bitfield_flag<std::uint8_t, struct tracke
 		// if a connection is erased while a timeout event is in the queue
 		std::unordered_map<std::uint32_t, std::shared_ptr<aux::udp_tracker_connection>> m_udp_conns;
 
-		std::vector<std::shared_ptr<aux::http_tracker_connection>> m_http_conns;
-		std::deque<std::shared_ptr<aux::http_tracker_connection>> m_queued;
+		// identifies a tracker server that announces/scrapes can share a single
+		// keep-alive connection to. It must capture everything that determines
+		// which socket the request would use: the origin host/port/scheme, the
+		// outgoing (bind) socket, the proxy, and -- since they are per-torrent --
+		// the SSL context and i2p connection. ssl_ctx / i2p_conn are stored as
+		// type-erased pointers (identity only) to keep this header light.
+		struct http_pool_key
+		{
+			std::string hostname;
+			aux::listen_socket_handle bind;
+			std::string proxy_hostname;
+			void const* ssl_ctx = nullptr;
+			void const* i2p_conn = nullptr;
+			// non-zero makes this key unique, so the request is never coalesced
+			// with another. Used for requests we can't reliably key (e.g. a URL
+			// that fails to parse), which must each get their own connection.
+			std::uint64_t no_coalesce = 0;
+			std::uint16_t port = 0;
+			std::uint16_t proxy_port = 0;
+			settings_pack::proxy_type_t proxy_type = settings_pack::none;
+			bool ssl = false;
+			// during shutdown, stop announces use a separate write-only connection
+			// so they aren't serialized behind normal keep-alive announces.
+			// In steady state this is false and stopped events share the
+			// regular connection.
+			bool is_stop = false;
+
+			bool operator==(http_pool_key const& o) const = default;
+		};
+
+		struct http_pool_key_hash
+		{
+			std::size_t operator()(http_pool_key const& k) const;
+		};
+
+		struct http_pool_entry
+		{
+			std::shared_ptr<aux::http_tracker_connection> conn;
+			http_pool_key key;
+			bool started = false;
+
+			// the connection's identity, used by index 2 below
+			aux::http_tracker_connection const* connection() const { return conn.get(); }
+		};
+
+		using http_pool_t = boost::multi_index::multi_index_container<http_pool_entry,
+			boost::multi_index::indexed_by<
+				// index 0: queue order (started entries and the pending queue)
+				boost::multi_index::sequenced<>,
+				// index 1: look up the connection to a given server (whether
+				// started or still queued) so a new request can coalesce onto it
+				boost::multi_index::hashed_unique<boost::multi_index::member<http_pool_entry,
+													  http_pool_key,
+													  &http_pool_entry::key>,
+					http_pool_key_hash>,
+				// index 2: look up an entry by its connection pointer, for
+				// remove_request()
+				boost::multi_index::hashed_unique<boost::multi_index::const_mem_fun<http_pool_entry,
+					aux::http_tracker_connection const*,
+					&http_pool_entry::connection>>>>;
+
+		// build the host key for a request (origin host from the URL, bind
+		// socket, proxy, ssl/i2p context). A request whose URL does not parse
+		// gets a unique key so it is never coalesced.
+		http_pool_key make_pool_key(tracker_request const& req);
+
+		// start the oldest not-yet-started queued connection, if below the
+		// concurrency limit.
+		void start_next_queued();
+
+		// all HTTP tracker connections, both started (open socket) and queued.
+		// At most one entry per server (host key); same-server requests coalesce
+		// onto a single connection.
+		http_pool_t m_http_conns;
+
+		// number of started entries in m_http_conns, bounded by
+		// settings_pack::max_concurrent_http_announces.
+		int m_num_started_http = 0;
+
+		// monotonic counter handing out unique no_coalesce values for requests
+		// that must not be coalesced (see http_pool_key::no_coalesce).
+		std::uint64_t m_http_unique = 0;
 
 #if TORRENT_USE_RTC
 		// websocket connections by URL

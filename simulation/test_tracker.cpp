@@ -283,6 +283,253 @@ TORRENT_TEST(announce_interval_1200)
 	test_interval(3600);
 }
 
+// a hybrid torrent announces both its v1 and v2 info-hashes to the tracker. The
+// two announces target the same server and overlap in time, so they must be
+// coalesced onto a single keep-alive connection rather than each opening a new
+// socket.
+TORRENT_TEST(tracker_coalesce_keepalive)
+{
+	using sim::asio::ip::address_v4;
+	sim::default_config network_cfg;
+	sim::simulation sim{network_cfg};
+
+	bool ran_to_completion = false;
+
+	sim::asio::io_context web_server(sim, make_address_v4("2.2.2.2"));
+	sim::http_server http(web_server, 8080);
+
+	int announces = 0;
+	http.register_handler("/announce",
+		[&](std::string /* method */,
+			std::string /* req */
+			,
+			std::map<std::string, std::string>&) {
+			if (!ran_to_completion) ++announces;
+			std::string const body = "d8:intervali1800e5:peers0:e";
+			return sim::send_response(200, "OK", int(body.size())) + body;
+		});
+
+	int connections = 0;
+
+	lt::settings_pack default_settings = settings();
+	default_settings.set_str(settings_pack::listen_interfaces, "0.0.0.0:6881");
+	lt::add_torrent_params default_add_torrent;
+
+	setup_swarm(
+		1,
+		swarm_test::upload,
+		sim,
+		default_settings,
+		default_add_torrent,
+		[](lt::settings_pack&) {},
+		[](lt::add_torrent_params& params) {
+			params.trackers.push_back("http://2.2.2.2:8080/announce");
+		},
+		[&](lt::alert const*, lt::session&) {},
+		[&](int const ticks, lt::session&) -> bool {
+			if (ticks > 5)
+			{
+				ran_to_completion = true;
+				// record the connection count before the stop-announce
+				connections = http.accepted_connections();
+				return true;
+			}
+			return false;
+		});
+
+	TEST_CHECK(ran_to_completion);
+	// both the v1 and v2 announces reached the tracker...
+	TEST_EQUAL(announces, 2);
+	// ...over a single coalesced connection
+	TEST_EQUAL(connections, 1);
+}
+
+TORRENT_TEST(tracker_coalesce_keepalive_after_error)
+{
+	// a per-response error (a complete HTTP response with a non-200 status) on
+	// the first coalesced request must not tear down the keep-alive connection:
+	// the second coalesced request is still served on the same socket. Before
+	// the fail-granularity change the error closed the connection and the second
+	// request opened a fresh one (connections would be 2).
+	using sim::asio::ip::address_v4;
+	sim::default_config network_cfg;
+	sim::simulation sim{network_cfg};
+
+	bool ran_to_completion = false;
+
+	sim::asio::io_context web_server(sim, make_address_v4("2.2.2.2"));
+	sim::http_server http(web_server, 8080);
+
+	int announces = 0;
+	http.register_handler("/announce",
+		[&](std::string /* method */,
+			std::string /* req */
+			,
+			std::map<std::string, std::string>&) {
+			int const n = ran_to_completion ? -1 : announces++;
+			if (n == 0)
+			{
+				// fail the first announce with a complete, well-framed HTTP error
+				// response, so the socket is left at a clean message boundary.
+				std::string const body = "d14:failure reason5:helloe";
+				return sim::send_response(404, "Not Found", int(body.size())) + body;
+			}
+			std::string const body = "d8:intervali1800e5:peers0:e";
+			return sim::send_response(200, "OK", int(body.size())) + body;
+		});
+
+	int connections = 0;
+
+	lt::settings_pack default_settings = settings();
+	default_settings.set_str(settings_pack::listen_interfaces, "0.0.0.0:6881");
+	lt::add_torrent_params default_add_torrent;
+
+	setup_swarm(
+		1,
+		swarm_test::upload,
+		sim,
+		default_settings,
+		default_add_torrent,
+		[](lt::settings_pack&) {},
+		[](lt::add_torrent_params& params) {
+			params.trackers.push_back("http://2.2.2.2:8080/announce");
+		},
+		[&](lt::alert const*, lt::session&) {},
+		[&](int const ticks, lt::session&) -> bool {
+			if (ticks > 5)
+			{
+				ran_to_completion = true;
+				connections = http.accepted_connections();
+				return true;
+			}
+			return false;
+		});
+
+	TEST_CHECK(ran_to_completion);
+	// both announces reached the tracker (the first failed, the second succeeded)...
+	TEST_EQUAL(announces, 2);
+	// ...still over a single connection: the error did not close it
+	TEST_EQUAL(connections, 1);
+}
+
+namespace {
+	// resolves a single tracker hostname slowly, so the first announce to it sits in
+	// DNS resolution for a long, deterministic window while later announces to the
+	// same host pile up as queued followers on the (already pooled) connection.
+	struct slow_dns_config : sim::default_config
+	{
+		chrono::high_resolution_clock::duration hostname_lookup(asio::ip::address const& requestor,
+			std::string hostname,
+			std::vector<asio::ip::address>& result,
+			boost::system::error_code& ec) override
+		{
+			if (hostname == "slowtracker.test")
+			{
+				result.push_back(make_address_v4("2.2.2.2"));
+				return duration_cast<chrono::high_resolution_clock::duration>(chrono::seconds(2));
+			}
+			return default_config::hostname_lookup(requestor, hostname, result, ec);
+		}
+	};
+}
+
+TORRENT_TEST(tracker_high_priority_jumps_follower_queue)
+{
+	// A high-priority announce that coalesces onto a connection which already has
+	// queued followers must jump to the front of the per-connection FIFO: it is
+	// served ahead of the normal followers that were queued earlier (it cannot
+	// preempt the request that is already in flight).
+	//
+	// This uses four separate torrents that all announce to the same slow-
+	// resolving host, so their announces coalesce onto one connection (the
+	// tracker connection pool is keyed by destination, not by torrent).
+	// A torrent's very first announce is high priority exactly when
+	// settings_pack::torrent_connect_boost is non-zero at the moment the
+	// torrent is added (torrent::start_announcing() reads it once, into
+	// m_connect_boost_counter). Toggling that setting between add_torrent()
+	// calls produces low- and then high-priority followers, without going
+	// through force_reannounce() or any tier-ordering logic.
+	slow_dns_config network_cfg;
+	sim::simulation sim{network_cfg};
+	sim::asio::io_context ios0{sim, make_address_v4("10.0.0.1")};
+	sim::asio::io_context web_server(sim, make_address_v4("2.2.2.2"));
+	sim::http_server http(web_server, 8080);
+
+	std::vector<std::string> order;
+	auto const make_handler = [&order](std::string path) {
+		return [&order, path](std::string /* method */,
+				   std::string /* req */
+				   ,
+				   std::map<std::string, std::string>&) {
+			order.push_back(path);
+			std::string const body = "d8:intervali1800e5:peers0:e";
+			return sim::send_response(200, "OK", int(body.size())) + body;
+		};
+	};
+	http.register_handler("/announce-a", make_handler("/announce-a"));
+	http.register_handler("/announce-b", make_handler("/announce-b"));
+	http.register_handler("/announce-c", make_handler("/announce-c"));
+	http.register_handler("/announce-d", make_handler("/announce-d"));
+
+	lt::settings_pack pack = settings();
+	pack.set_str(settings_pack::listen_interfaces, "10.0.0.1:6881");
+
+	auto ses = std::make_shared<lt::session>(pack, ios0);
+
+	// v1-only torrent, so there is exactly one announce per tracker.
+	auto const add = [&](int const idx, char const* path) {
+		lt::add_torrent_params params = ::create_torrent(idx, true, 9, lt::create_torrent::v1_only);
+		params.flags &= ~lt::torrent_flags::auto_managed;
+		params.flags &= ~lt::torrent_flags::paused;
+		params.trackers.push_back(std::string("http://slowtracker.test:8080") + path);
+		ses->async_add_torrent(std::move(params));
+	};
+
+	sim::timer t_start(sim, lt::seconds(0), [&](boost::system::error_code const&) {
+		// default torrent_connect_boost (non-zero): torrent a's first announce
+		// is high priority. It becomes the in-flight request while the slow DNS
+		// lookup for the shared host is outstanding.
+		add(0, "/announce-a");
+
+		// disable connect boost so the next two torrents' first announces are
+		// NOT high priority: they queue as normal followers behind a.
+		lt::settings_pack boost_off;
+		boost_off.set_int(settings_pack::torrent_connect_boost, 0);
+		ses->apply_settings(boost_off);
+
+		add(1, "/announce-b");
+		add(2, "/announce-c");
+
+		// re-enable connect boost so this torrent's first announce is high
+		// priority again -- it must jump ahead of the already-queued b, c.
+		lt::settings_pack boost_on;
+		boost_on.set_int(settings_pack::torrent_connect_boost, 30);
+		ses->apply_settings(boost_on);
+
+		add(3, "/announce-d");
+	});
+
+	lt::session_proxy zombie;
+	sim::timer t_end(sim, lt::seconds(12), [&](boost::system::error_code const&) {
+		zombie = ses->abort();
+		ses.reset();
+	});
+
+	sim.run();
+
+	auto const pos = [&](char const* p) -> int {
+		for (int i = 0; i < int(order.size()); ++i)
+			if (order[i] == p) return i;
+		return int(order.size());
+	};
+
+	// the in-flight request (a) is served first...
+	TEST_CHECK(!order.empty() && order.front() == "/announce-a");
+	// ...then the high-priority d jumps ahead of the earlier-queued b and c
+	TEST_CHECK(pos("/announce-d") < pos("/announce-b"));
+	TEST_CHECK(pos("/announce-d") < pos("/announce-c"));
+}
+
 namespace {
 struct sim_config : sim::default_config
 {

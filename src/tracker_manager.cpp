@@ -21,6 +21,10 @@ see LICENSE file.
 #include "libtorrent/aux_/ssl.hpp"
 #include "libtorrent/aux_/tracker_manager.hpp"
 #include "libtorrent/aux_/udp_tracker_connection.hpp"
+#include "libtorrent/aux_/parse_url.hpp"
+#include "libtorrent/aux_/proxy_settings.hpp"
+
+#include <boost/functional/hash.hpp>
 
 #if TORRENT_USE_RTC
 #include "libtorrent/aux_/websocket_tracker_connection.hpp"
@@ -200,32 +204,97 @@ namespace libtorrent::aux {
 		m_stats_counters.inc_stats_counter(counters::recv_tracker_bytes, bytes);
 	}
 
+	std::size_t tracker_manager::http_pool_key_hash::operator()(http_pool_key const& k) const
+	{
+		std::size_t ret = 0;
+		boost::hash_combine(ret, std::hash<std::string>{}(k.hostname));
+		boost::hash_combine(ret, std::hash<std::uint16_t>{}(k.port));
+		boost::hash_combine(ret, std::hash<bool>{}(k.ssl));
+		boost::hash_combine(ret, std::hash<void const*>{}(k.ssl_ctx));
+		boost::hash_combine(ret, std::hash<void const*>{}(k.i2p_conn));
+		boost::hash_combine(ret, std::hash<void*>{}(static_cast<void*>(k.bind.get())));
+		boost::hash_combine(ret, std::hash<int>{}(int(k.proxy_type)));
+		boost::hash_combine(ret, std::hash<std::string>{}(k.proxy_hostname));
+		boost::hash_combine(ret, std::hash<std::uint16_t>{}(k.proxy_port));
+		boost::hash_combine(ret, std::hash<std::uint64_t>{}(k.no_coalesce));
+		boost::hash_combine(ret, std::hash<bool>{}(k.is_stop));
+		return ret;
+	}
+
+	tracker_manager::http_pool_key tracker_manager::make_pool_key(tracker_request const& req)
+	{
+		http_pool_key key;
+		// during shutdown, stop announces use a separate write-only connection
+		// so they don't block (or get blocked by) normal keep-alive announces.
+		// In steady state they share the same connection as regular announces.
+		key.is_stop = m_abort && (req.event == event_t::stopped);
+
+		error_code ec;
+		auto const components = parse_url_components(req.url, ec);
+		if (ec)
+		{
+			// the URL didn't parse, so we can't reliably key it. Give it a
+			// unique key so it gets its own connection and is never coalesced
+			// with an unrelated request.
+			key.no_coalesce = ++m_http_unique;
+			return key;
+		}
+		key.hostname = std::get<2>(components);
+		key.ssl = (std::get<0>(components) == "https");
+		int port = std::get<3>(components);
+		if (port == -1) port = key.ssl ? 443 : 80;
+		key.port = std::uint16_t(port);
+		key.bind = req.outgoing_socket;
+#if TORRENT_USE_SSL
+		// the ssl context is per-torrent, so it is part of the connection's
+		// identity for https. For plain http it is irrelevant (left null).
+		if (key.ssl) key.ssl_ctx = req.ssl_ctx;
+#endif
+#if TORRENT_USE_I2P
+		key.i2p_conn = req.i2pconn;
+#endif
+		aux::proxy_settings ps(m_settings);
+		if (ps.proxy_tracker_connections)
+		{
+			key.proxy_type = ps.type;
+			key.proxy_hostname = ps.hostname;
+			key.proxy_port = ps.port;
+		}
+		return key;
+	}
+
+	void tracker_manager::start_next_queued()
+	{
+		if (m_num_started_http >= m_settings.get_int(settings_pack::max_concurrent_http_announces))
+			return;
+
+		auto& seq = m_http_conns.get<0>();
+		auto const i = std::find_if(
+			seq.begin(), seq.end(), [](http_pool_entry const& e) { return !e.started; });
+		if (i == seq.end()) return;
+
+		seq.modify(i, [](http_pool_entry& e) { e.started = true; });
+		++m_num_started_http;
+		i->conn->start();
+	}
+
 	void tracker_manager::remove_request(aux::http_tracker_connection const* c)
 	{
 		TORRENT_ASSERT(is_single_thread());
-		auto const i = std::find_if(m_http_conns.begin(), m_http_conns.end()
-			, [c] (std::shared_ptr<aux::http_tracker_connection> const& ptr) { return ptr.get() == c; });
-		if (i != m_http_conns.end())
-		{
-			m_http_conns.erase(i);
-			if (!m_queued.empty())
-			{
-				auto conn = std::move(m_queued.front());
-				m_queued.pop_front();
-				m_http_conns.push_back(std::move(conn));
-				m_http_conns.back()->start();
-				m_stats_counters.set_value(counters::num_queued_tracker_announces, std::int64_t(m_queued.size()));
-			}
-			return;
-		}
+		auto& by_conn = m_http_conns.get<2>();
+		auto const i = by_conn.find(c);
+		if (i == by_conn.end()) return;
 
-		auto const j = std::find_if(m_queued.begin(), m_queued.end()
-			, [c] (std::shared_ptr<aux::http_tracker_connection> const& ptr) { return ptr.get() == c; });
-		if (j != m_queued.end())
+		bool const was_started = i->started;
+		by_conn.erase(i);
+		if (was_started)
 		{
-			m_queued.erase(j);
-			m_stats_counters.set_value(counters::num_queued_tracker_announces, std::int64_t(m_queued.size()));
+			--m_num_started_http;
+			// a socket slot freed up; promote the next queued connection
+			start_next_queued();
 		}
+		m_stats_counters.set_value(counters::num_queued_tracker_announces,
+			std::int64_t(m_http_conns.size()) - m_num_started_http);
 	}
 
 	void tracker_manager::remove_request(aux::udp_tracker_connection const* c)
@@ -280,23 +349,39 @@ namespace libtorrent::aux {
 		if (protocol == "http")
 #endif
 		{
-			auto con = std::make_shared<aux::http_tracker_connection>(ios, *this, std::move(req), c);
-			if (m_http_conns.size() < std::size_t(sett.get_int(settings_pack::max_concurrent_http_announces)))
+			http_pool_key key = make_pool_key(req);
+
+			// if there is already a connection to this server (started or still
+			// queued), coalesce this request onto it; it will be issued
+			// sequentially over the same keep-alive socket.
+			auto& by_key = m_http_conns.get<1>();
+			auto const existing = by_key.find(key);
+			if (existing != by_key.end())
 			{
-				m_http_conns.push_back(std::move(con));
-				m_http_conns.back()->start();
+				existing->conn->queue_request(std::move(req), c);
+				return;
+			}
+
+			auto con = std::make_shared<aux::http_tracker_connection>(ios, *this, std::move(req), c);
+			bool const start_now =
+				m_num_started_http < sett.get_int(settings_pack::max_concurrent_http_announces);
+
+			auto& seq = m_http_conns.get<0>();
+			if (start_now)
+			{
+				seq.push_back(http_pool_entry{con, std::move(key), true});
+				++m_num_started_http;
+				con->start();
 			}
 			else
 			{
+				// queued: high-priority requests jump to the front of the queue
 				if (high_priority)
-				{
-					m_queued.push_front(std::move(con));
-				}
+					seq.push_front(http_pool_entry{con, std::move(key), false});
 				else
-				{
-					m_queued.push_back(std::move(con));
-				}
-				m_stats_counters.set_value(counters::num_queued_tracker_announces, std::int64_t(m_queued.size()));
+					seq.push_back(http_pool_entry{con, std::move(key), false});
+				m_stats_counters.set_value(counters::num_queued_tracker_announces,
+					std::int64_t(m_http_conns.size()) - m_num_started_http);
 			}
 			return;
 		}
@@ -468,29 +553,24 @@ namespace libtorrent::aux {
 		std::vector<std::shared_ptr<aux::http_tracker_connection>> close_http_connections;
 		std::vector<std::shared_ptr<aux::udp_tracker_connection>> close_udp_connections;
 
-		for (auto const& c : m_queued)
+		// m_http_conns holds both started and queued connections
+		for (auto const& e : m_http_conns)
 		{
-			tracker_request const& req = c->tracker_req();
+			// cancel followers that won't survive this abort, on every connection
+			// -- including ones we keep open below. A full abort drops all
+			// followers; a partial abort keeps only stop-requests. Without this, a
+			// connection kept for its stop in-flight request would still issue its
+			// non-stop followers during shutdown.
+			e.conn->prune_followers(!all);
+
+			tracker_request const& req = e.conn->tracker_req();
 			if (req.event == event_t::stopped && !all)
 				continue;
 
-			close_http_connections.push_back(c);
+			close_http_connections.push_back(e.conn);
 
 #ifndef TORRENT_DISABLE_LOGGING
-			std::shared_ptr<request_callback> rc = c->requester();
-			if (rc) rc->debug_log("aborting: %s", req.url.c_str());
-#endif
-		}
-		for (auto const& c : m_http_conns)
-		{
-			tracker_request const& req = c->tracker_req();
-			if (req.event == event_t::stopped && !all)
-				continue;
-
-			close_http_connections.push_back(c);
-
-#ifndef TORRENT_DISABLE_LOGGING
-			std::shared_ptr<request_callback> rc = c->requester();
+			std::shared_ptr<request_callback> rc = e.conn->requester();
 			if (rc) rc->debug_log("aborting: %s", req.url.c_str());
 #endif
 		}
@@ -523,6 +603,8 @@ namespace libtorrent::aux {
 		}
 #endif
 
+		// followers were already pruned above; close() re-dispatches any kept
+		// stop-requests onto a fresh connection.
 		for (auto const& c : close_http_connections)
 			c->close();
 

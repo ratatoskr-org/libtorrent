@@ -95,7 +95,16 @@ struct TORRENT_EXTRA_EXPORT http_connection
 #if TORRENT_USE_I2P
 		i2p_connection* i2p_conn = nullptr,
 #endif
-		bool keep_alive = false);
+		bool keep_alive = false,
+		// fire-and-forget: write the request but read no response. On each write
+		// completion the write-handler (set_write_handler) is invoked instead of
+		// starting a read. Used for best-effort stop announces at shutdown, where
+		// the response is irrelevant.
+		bool write_only = false);
+
+	// set the handler invoked when a write completes in write_only mode (the
+	// caller then writes the next request or closes the connection).
+	void set_write_handler(http_connect_handler h) { m_write_handler = std::move(h); }
 
 	void start(std::string const& hostname, int port
 		, time_duration timeout, aux::proxy_settings const* ps = nullptr
@@ -127,6 +136,9 @@ private:
 	void on_connect(error_code const& e);
 	void on_write(error_code const& e);
 	void on_read(error_code const& e, std::size_t bytes_transferred);
+	// write_only drain loop: read into m_drain_buffer and discard, repeatedly.
+	void start_drain();
+	void on_drain(error_code const& e, std::size_t bytes_transferred);
 	static void on_timeout(std::weak_ptr<http_connection> p
 		, error_code const& e);
 	void on_assign_bandwidth(error_code const& e);
@@ -134,6 +146,11 @@ private:
 	void callback(error_code e, span<char> data = {});
 
 	aux::vector<char> m_recvbuffer;
+
+	// scratch buffer for the write_only drain loop (responses are discarded). A
+	// separate buffer so it doesn't race with m_recvbuffer being reset for the
+	// next pipelined write.
+	aux::vector<char> m_drain_buffer;
 	io_context& m_ios;
 
 	std::string m_hostname;
@@ -162,6 +179,9 @@ private:
 	http_connect_handler m_connect_handler;
 	http_filter_handler m_filter_handler;
 	hostname_filter_handler m_hostname_filter_handler;
+	// invoked on write completion in write_only mode, instead of reading a
+	// response (see set_write_handler / get()'s write_only).
+	http_connect_handler m_write_handler;
 	deadline_timer m_timer;
 
 	time_duration m_completion_timeout;
@@ -232,6 +252,16 @@ private:
 	// whether the most recent get() call requested keep-alive. Preserved so
 	// that a redirect re-issues get() with the same keep-alive intent.
 	bool m_keep_alive = false;
+
+	// fire-and-forget mode: write requests but never parse a response. The socket
+	// stays reusable for the next write without waiting for (or reading) a reply.
+	bool m_write_only = false;
+
+	// true while the drain loop (read-and-discard) is running in write_only mode.
+	// Draining keeps the receive buffer empty so the server keeps processing our
+	// pipelined requests and close() issues a FIN (flushing the send buffer)
+	// rather than a RST.
+	bool m_draining = false;
 };
 
 }

@@ -229,6 +229,10 @@ namespace libtorrent::aux {
 				tracker_req().ssl_ctx
 #endif
 			);
+			// drives the write_only (stop-announce) path: each completed write
+			// advances to the next queued request or closes the connection.
+			m_tracker_connection->set_write_handler(
+				std::bind(&http_tracker_connection::on_write_complete, shared_from_this(), _1));
 		}
 
 		int const timeout = tracker_req().event == event_t::stopped
@@ -256,6 +260,13 @@ namespace libtorrent::aux {
 		// to avoid being blocked for slow or failing responses. Chances
 		// are that we're shutting down, and this should be a best-effort
 		// attempt. It's not worth stalling shutdown.
+
+		// Capture write_only once at request-dispatch time and store it.
+		// next_request() must NOT re-evaluate m_man.is_stopping() because the
+		// session may transition to stopping AFTER this connection is created,
+		// which would leave a non-write_only connection without a close path.
+		m_write_only = m_man.is_stopping() && tracker_req().event == event_t::stopped;
+
 		aux::proxy_settings ps(settings);
 		m_tracker_connection->get(url,
 			seconds(timeout),
@@ -278,7 +289,12 @@ namespace libtorrent::aux {
 			// follower that may be queued while this request is in flight. When
 			// the queue drains, the connection is closed immediately (see
 			// next_request()), so this does not leak idle sockets.
-			true);
+			true,
+			// during shutdown, stop announces are best-effort: write and forget,
+			// don't wait for a response. In steady state a stopped event is a
+			// normal request and the response is read so the connection can be
+			// reused for subsequent announces.
+			m_write_only);
 
 		// the url + 100 estimated header size
 		sent_bytes(int(url.size()) + 100);
@@ -296,16 +312,41 @@ namespace libtorrent::aux {
 	void http_tracker_connection::queue_request(
 		tracker_request req, std::weak_ptr<request_callback> c)
 	{
-		m_followers.emplace_back(std::move(req), std::move(c));
+		// high-priority requests jump ahead of the other queued followers, but
+		// cannot preempt the in-flight request (that is m_req, which is not part
+		// of m_followers, so the front of m_followers is the next one served).
+		if (req.kind & tracker_request::high_priority)
+			m_followers.emplace_front(std::move(req), std::move(c));
+		else
+			m_followers.emplace_back(std::move(req), std::move(c));
+	}
+
+	void http_tracker_connection::on_write_complete(aux::http_connection&)
+	{
+		// a stop announce was written; we don't read a response. Move on to the
+		// next queued stop, or close the connection once the queue drains.
+		next_request();
 	}
 
 	void http_tracker_connection::next_request()
 	{
 		if (m_followers.empty())
 		{
+			// during shutdown, a write_only stop connection doesn't close the instant
+			// its queue drains: it keeps the socket open while the drain loop reads
+			// the outstanding responses and the writes flush, then closes gracefully
+			// when the deadline timer fires (which calls on_write_complete again).
+			if (m_write_only && !m_flushing)
+			{
+				m_flushing = true;
+				return;
+			}
 			close();
 			return;
 		}
+
+		// another request is going in flight; we're no longer just flushing.
+		m_flushing = false;
 
 		// promote the next queued request to be the in-flight request and issue
 		// it on this connection. http_connection reuses the keep-alive socket if
@@ -320,6 +361,24 @@ namespace libtorrent::aux {
 		send_request();
 	}
 
+	void http_tracker_connection::prune_followers(bool const keep_stopped)
+	{
+		if (!keep_stopped)
+		{
+			m_followers.clear();
+			return;
+		}
+		// keep only stop-requests; close() re-dispatches them so they are still
+		// announced while shutting down. Everything else is dropped.
+		m_followers.erase(
+			std::remove_if(m_followers.begin(),
+				m_followers.end(),
+				[](std::pair<tracker_request, std::weak_ptr<request_callback>> const& f) {
+					return f.first.event != event_t::stopped;
+				}),
+			m_followers.end());
+	}
+
 	void http_tracker_connection::close()
 	{
 		if (m_tracker_connection)
@@ -328,7 +387,24 @@ namespace libtorrent::aux {
 			m_tracker_connection.reset();
 		}
 		cancel();
-		m_man.remove_request(this);
+
+		// re-dispatch any followers that have not been served yet (e.g. the
+		// in-flight request failed). They go back through the manager and are
+		// retried on a fresh connection. Capture the manager/io_context (which
+		// outlive this connection) before remove_request, which may drop the last
+		// reference to 'this'. Remove this connection from the pool first, so the
+		// followers don't coalesce back onto the connection that is going away.
+		// (During abort the manager calls prune_followers() first, so only
+		// stop-requests, if any, remain here to be re-dispatched.)
+		std::deque<std::pair<tracker_request, std::weak_ptr<request_callback>>> followers =
+			std::move(m_followers);
+		m_followers.clear();
+		tracker_manager& man = m_man;
+		io_context& ioc = m_ioc;
+		aux::session_settings const& sett = man.settings();
+		man.remove_request(this);
+		for (auto& f : followers)
+			man.queue_request(ioc, std::move(f.first), sett, std::move(f.second));
 	}
 
 	// endpoints is an in-out parameter
@@ -451,9 +527,18 @@ namespace libtorrent::aux {
 
 		if (parser.status_code() != 200)
 		{
-			fail(error_code(parser.status_code(), http_category())
-				, operation_t::bittorrent
-				, parser.message().c_str());
+			// a complete HTTP response with an error status: the socket is still
+			// at a clean message boundary, so fail just this request and continue
+			// with the next queued follower (reusing the keep-alive socket if the
+			// server allowed it) rather than tearing the connection down. With no
+			// followers, next_request() closes, matching the old behavior.
+			if (auto const cb = requester())
+				cb->tracker_request_error(tracker_req(),
+					error_code(parser.status_code(), http_category()),
+					operation_t::bittorrent,
+					parser.message(),
+					seconds32(0));
+			next_request();
 			return;
 		}
 
@@ -480,10 +565,16 @@ namespace libtorrent::aux {
 
 		if (ecode)
 		{
-			fail(ecode, operation_t::bittorrent
-				, resp.failure_reason.c_str()
-				, resp.interval, resp.min_interval);
-			close();
+			// the HTTP response framed correctly but the tracker payload didn't
+			// parse (or the tracker reported a failure). The connection itself is
+			// still healthy, so report it to this requester and move on to the
+			// next follower rather than closing.
+			cb->tracker_request_error(tracker_req(),
+				ecode,
+				operation_t::bittorrent,
+				resp.failure_reason,
+				resp.interval.count() == 0 ? resp.min_interval : resp.interval);
+			next_request();
 			return;
 		}
 
